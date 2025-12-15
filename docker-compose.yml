@@ -1,0 +1,27 @@
+services:
+  app:
+    build: .
+    container_name: insta-archiver-app
+    restart: always
+    ports:
+      - "${PORT}:${PORT}"
+    depends_on:
+      - redis
+    volumes:
+      - ./cookies.txt:/app/cookies.txt:ro
+      - ./downloads:/app/downloads
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+  redis:
+    image: redis:alpine
+    container_name: insta-archiver-redis
+    restart: always
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
