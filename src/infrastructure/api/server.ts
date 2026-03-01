@@ -1,24 +1,25 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { ITaskQueue } from '../../domain/interfaces';
 
 export const createServer = (queue: ITaskQueue, secret: string) => {
     const app = express();
     app.use(express.json());
 
-    // Middleware авторизации
-    app.use((req, res, next) => {
+    app.use((req: Request, res: Response, next: NextFunction) => {
         const authHeader = req.headers['authorization'];
         if (authHeader !== secret) {
-            return res.status(403).json({ error: 'Forbidden' });
+            res.status(403).json({ error: 'Forbidden' });
+            return;
         }
         next();
     });
 
-    app.post('/api/v1/task', async (req, res) => {
+    app.post('/api/v1/task', async (req: Request, res: Response) => {
         try {
             const { url } = req.body;
             if (!url || !url.includes('instagram.com')) {
-                return res.status(400).json({ error: 'Invalid URL' });
+                res.status(400).json({ error: 'Invalid URL' });
+                return;
             }
 
             const jobId = await queue.add({
