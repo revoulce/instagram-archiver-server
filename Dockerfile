@@ -8,7 +8,10 @@ RUN npm run build && npm prune --omit=dev
 
 FROM node:24-bookworm-slim
 ARG GALLERY_DL_VERSION=1.32.14
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# The slim image has no system CA bundle yet; bootstrap HTTPS with Node's trusted roots.
+RUN node -e "const fs = require('node:fs'); fs.mkdirSync('/etc/ssl/certs', { recursive: true }); fs.writeFileSync('/etc/ssl/certs/ca-certificates.crt', require('node:tls').rootCertificates.join('\n')); const p = '/etc/apt/sources.list.d/debian.sources'; fs.writeFileSync(p, fs.readFileSync(p, 'utf8').replaceAll('http://deb.debian.org', 'https://deb.debian.org'));" \
+    && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=15 update \
+    && apt-get -o Acquire::Retries=3 -o Acquire::https::Timeout=15 install -y --no-install-recommends \
     python3 python3-venv ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN python3 -m venv /opt/gallery-dl \
