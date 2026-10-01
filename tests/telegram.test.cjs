@@ -33,9 +33,9 @@ for (const count of [1, 2, 10, 11, 20, 21]) {
     test(`send ${count} media files without a one-item media group`, async () => {
         const service = new GrammyService('123:test-token', '-100123');
         const calls = [];
-        service.bot.api.sendMediaGroup = async (_channel, media) => { calls.push({ type: 'group', media }); };
-        service.bot.api.sendPhoto = async (_channel, media, options) => { calls.push({ type: 'photo', media: [{ media, ...options }] }); };
-        service.bot.api.sendVideo = async (_channel, media, options) => { calls.push({ type: 'video', media: [{ media, ...options }] }); };
+        service.bot.api.sendMediaGroup = async (_channel, media) => { calls.push({ type: 'group', media }); return media.map((_, index) => ({ message_id: index + 1 })); };
+        service.bot.api.sendPhoto = async (_channel, media, options) => { calls.push({ type: 'photo', media: [{ media, ...options }] }); return { message_id: 100 }; };
+        service.bot.api.sendVideo = async (_channel, media, options) => { calls.push({ type: 'video', media: [{ media, ...options }] }); return { message_id: 101 }; };
         const filePaths = Array.from({ length: count }, (_, index) => index === count - 1 ? `${index}.MP4` : `${index}.jpg`);
         await service.sendPost({ ...metadata, filePaths }, url);
         assert.equal(calls.flatMap(call => call.media).length, count);

@@ -9,6 +9,32 @@ test('Instagram links are canonicalized without query or fragment', () => {
     assert.equal(normalizeInstagramUrl('https://instagram.com/stories/user.name/12345/'), 'https://www.instagram.com/stories/user.name/12345/');
 });
 
+test('status and retry endpoints require authentication and return explicit conflict states', async t => {
+    let retryResult = 'queued';
+    const queue = {
+        getStatus: async id => id === '42' ? { id, status: 'failed', sentFiles: 10, totalFiles: 11, requiresReview: true } : null,
+        retry: async () => retryResult,
+    };
+    const server = createServer(queue, 'test-key').listen(0, '127.0.0.1');
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    await once(server, 'listening');
+    const base = `http://127.0.0.1:${server.address().port}/api/v1/task`;
+    const get = async (path, options = {}) => {
+        const response = await fetch(base + path, { headers: { Authorization: 'test-key' }, ...options });
+        return { status: response.status, body: await response.json() };
+    };
+    assert.equal((await get('/42', { headers: {} })).status, 403);
+    assert.equal((await get('/missing')).status, 404);
+    assert.equal((await get('/bad%20id')).status, 400);
+    assert.equal((await get('/42')).body.sentFiles, 10);
+    assert.deepEqual((await get('/42/retry', { method: 'POST' })).body, { status: 'queued', jobId: '42' });
+    for (const [result, status] of [['not_found', 404], ['conflict', 409], ['requires_review', 409]]) {
+        retryResult = result;
+        assert.equal((await get('/42/retry', { method: 'POST' })).status, status);
+    }
+    assert.equal((await get('/42/retry', { method: 'POST' })).body.requiresReview, true);
+});
+
 test('reject foreign hosts, credentials, protocols, ports and unsupported routes', () => {
     for (const value of [undefined, 123, {}, ['https://instagram.com/p/ABC/'],
         'https://instagram.com.evil.example/p/ABC/', 'https://evil.example/instagram.com',

@@ -37,6 +37,33 @@ export const createServer = (queue: ITaskQueue, secret: string) => {
         }
     });
 
+    app.get('/api/v1/task/:id', async (req: Request, res: Response) => {
+        const id = req.params.id as string;
+        if (!/^[\w-]{1,128}$/.test(id)) {
+            res.status(400).json({ error: 'Invalid task ID' });
+            return;
+        }
+        const status = await queue.getStatus(id);
+        if (!status) {
+            res.status(404).json({ error: 'Task not found' });
+            return;
+        }
+        res.json(status);
+    });
+
+    app.post('/api/v1/task/:id/retry', async (req: Request, res: Response) => {
+        const id = req.params.id as string;
+        if (!/^[\w-]{1,128}$/.test(id)) {
+            res.status(400).json({ error: 'Invalid task ID' });
+            return;
+        }
+        const result = await queue.retry(id);
+        if (result === 'not_found') res.status(404).json({ error: 'Task not found' });
+        else if (result === 'requires_review') res.status(409).json({ error: 'Review Telegram delivery before retrying', requiresReview: true });
+        else if (result === 'conflict') res.status(409).json({ error: 'Only failed tasks can be retried' });
+        else res.json({ status: 'queued', jobId: id });
+    });
+
     app.use((error: { status?: number }, _req: Request, res: Response, _next: NextFunction) => {
         if (error.status === 400 || error.status === 413) {
             res.status(error.status).json({ error: error.status === 413 ? 'Request body too large' : 'Invalid JSON' });

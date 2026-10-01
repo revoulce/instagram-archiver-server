@@ -100,6 +100,19 @@ export class GalleryDLService implements IDownloader {
         await fs.rm(directory, { recursive: true, force: true });
     }
 
+    async isAvailable(metadata: MediaMetadata): Promise<boolean> {
+        const directory = path.resolve(metadata.downloadDirectory);
+        if (path.dirname(directory) !== this.downloadBasePath || !metadata.filePaths.length) return false;
+        try {
+            for (const file of metadata.filePaths) {
+                if (path.dirname(path.resolve(file)) !== directory || !(await fs.lstat(file)).isFile()) return false;
+            }
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     private findMetadataInJson(obj: any): any {
         if (!obj || typeof obj !== 'object') return null;
 

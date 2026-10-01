@@ -16,3 +16,25 @@ export interface MediaMetadata {
     filePaths: string[];
     mediaType: 'image' | 'video' | 'album';
 }
+
+export interface TaskCheckpoint {
+    metadata?: MediaMetadata;
+    nextFileIndex: number;
+    messageIds: number[];
+    pendingFileIndex?: number;
+    filesDiscarded?: boolean;
+}
+
+export interface TaskStatus {
+    id: string;
+    url: string;
+    status: 'pending' | 'processing' | 'retrying' | 'completed' | 'failed' | 'unknown';
+    attemptsMade: number;
+    createdAt: string;
+    finishedAt: string | null;
+    sentFiles: number;
+    totalFiles: number | null;
+    messageIds: number[];
+    requiresReview: boolean;
+    error?: string;
+}
