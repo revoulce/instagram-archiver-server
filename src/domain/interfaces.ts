@@ -2,6 +2,7 @@ import {DownloadTask, MediaMetadata} from "./entities";
 
 export interface IDownloader {
     download(url: string): Promise<MediaMetadata>;
+    cleanup(metadata: MediaMetadata): Promise<void>;
 }
 
 export interface INotifier {

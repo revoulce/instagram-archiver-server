@@ -1,4 +1,6 @@
 /tmp
+/cookies.txt
+/downloads/
 /out-tsc
 
 /node_modules

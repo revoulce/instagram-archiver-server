@@ -4,7 +4,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { IDownloader } from '../../domain/interfaces';
 import { MediaMetadata } from '../../domain/entities';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 
 const execFileAsync = promisify(execFile);
 
@@ -12,13 +12,13 @@ export class GalleryDLService implements IDownloader {
     private cookiesPath: string;
     private downloadBasePath: string;
 
-    constructor(cookiesPath: string, downloadBasePath: string) {
+    constructor(cookiesPath: string, downloadBasePath: string, private timeoutMs = 600_000) {
         this.cookiesPath = cookiesPath;
-        this.downloadBasePath = downloadBasePath;
+        this.downloadBasePath = path.resolve(downloadBasePath);
     }
 
     async download(url: string): Promise<MediaMetadata> {
-        const taskId = uuidv4();
+        const taskId = randomUUID();
         const taskDir = path.join(this.downloadBasePath, taskId);
         await fs.mkdir(taskDir, { recursive: true });
 
@@ -30,7 +30,7 @@ export class GalleryDLService implements IDownloader {
                 '--dump-json',
                 '--no-download',
                 url
-            ], { maxBuffer: 1024 * 1024 * 50 });
+            ], { maxBuffer: 1024 * 1024 * 50, timeout: this.timeoutMs });
 
             let metaRaw: any = null;
 
@@ -52,9 +52,6 @@ export class GalleryDLService implements IDownloader {
             }
 
             if (!metaRaw) {
-                console.error('--- [GalleryDL] RAW OUTPUT START ---');
-                console.error(metaStdout);
-                console.error('--- [GalleryDL] RAW OUTPUT END ---');
                 throw new Error('Could not find valid metadata in gallery-dl output');
             }
 
@@ -64,19 +61,22 @@ export class GalleryDLService implements IDownloader {
                 '--cookies', this.cookiesPath,
                 '--directory', taskDir,
                 url
-            ]);
+            ], { maxBuffer: 1024 * 1024 * 50, timeout: this.timeoutMs });
 
-            const files = await fs.readdir(taskDir);
-            const filePaths = files.map(f => path.join(taskDir, f));
+            const files = await fs.readdir(taskDir, { withFileTypes: true });
+            const filePaths = files
+                .filter(file => file.isFile() && /\.(jpe?g|png|webp|mp4)$/i.test(file.name))
+                .map(file => path.join(taskDir, file.name));
 
             if (filePaths.length === 0) {
                 throw new Error('Gallery-dl finished but no files were found.');
             }
 
-            const isVideo = filePaths.some(f => f.endsWith('.mp4'));
+            const isVideo = filePaths.some(f => path.extname(f).toLowerCase() === '.mp4');
             const mediaType = filePaths.length > 1 ? 'album' : (isVideo ? 'video' : 'image');
 
             return {
+                downloadDirectory: taskDir,
                 description: metaRaw.description || metaRaw.caption || '',
                 author: metaRaw.fullname || metaRaw.username || 'unknown',
                 likes: metaRaw.likes || 0,
@@ -89,6 +89,15 @@ export class GalleryDLService implements IDownloader {
             await fs.rm(taskDir, { recursive: true, force: true }).catch(() => {});
             throw error;
         }
+    }
+
+    async cleanup(metadata: MediaMetadata): Promise<void> {
+        const directory = path.resolve(metadata.downloadDirectory);
+        if (path.dirname(directory) !== this.downloadBasePath ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(path.basename(directory))) {
+            throw new Error('Refusing to clean a directory outside the task workspace');
+        }
+        await fs.rm(directory, { recursive: true, force: true });
     }
 
     private findMetadataInJson(obj: any): any {

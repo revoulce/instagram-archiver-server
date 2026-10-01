@@ -8,6 +8,7 @@ export interface DownloadTask {
 }
 
 export interface MediaMetadata {
+    downloadDirectory: string;
     description: string;
     author: string;
     likes: number;

@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-import path from 'path';
+import { loadConfig } from './config';
 import { GalleryDLService } from './infrastructure/downloader/GalleryDLService';
 import { GrammyService } from './infrastructure/telegram/GrammyService';
 import { QueueService } from './infrastructure/queue/QueueService';
@@ -7,29 +7,29 @@ import { createServer } from './infrastructure/api/server';
 
 dotenv.config();
 
-const PORT = process.env.PORT || 3000;
-const AUTH_SECRET = process.env.AUTH_SECRET || 'secret';
+const config = loadConfig();
 
 const downloader = new GalleryDLService(
-    process.env.COOKIES_PATH || './cookies.txt',
-    process.env.DOWNLOAD_PATH || './downloads'
+    config.cookiesPath,
+    config.downloadPath,
+    config.downloadTimeoutMs
 );
 
 const notifier = new GrammyService(
-    process.env.TELEGRAM_BOT_TOKEN!,
-    process.env.TELEGRAM_CHANNEL_ID!
+    config.telegramBotToken,
+    config.telegramChannelId
 );
 
 const queueService = new QueueService(
-    process.env.REDIS_HOST || 'localhost',
-    Number(process.env.REDIS_PORT) || 6379,
+    config.redisHost,
+    config.redisPort,
     downloader,
     notifier
 );
 
-const app = createServer(queueService, AUTH_SECRET);
+const app = createServer(queueService, config.authSecret);
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+app.listen(config.port, () => {
+    console.log(`Server running on port ${config.port}`);
     console.log(`Waiting for Instagram links...`);
 });

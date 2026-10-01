@@ -1,6 +1,7 @@
 import { Queue, Worker, Job } from 'bullmq';
 import { ITaskQueue, IDownloader, INotifier } from '../../domain/interfaces';
 import { DownloadTask } from '../../domain/entities';
+import { ProcessTask } from '../../application/ProcessTask';
 
 export class QueueService implements ITaskQueue {
     private queue: Queue;
@@ -15,15 +16,14 @@ export class QueueService implements ITaskQueue {
         const connection = { host: redisHost, port: redisPort };
 
         this.queue = new Queue('instagram-tasks', { connection });
+        const processTask = new ProcessTask(this.downloader, this.notifier);
 
         this.worker = new Worker('instagram-tasks', async (job: Job) => {
             const { url } = job.data;
             console.log(`[Job ${job.id}] Processing: ${url}`);
 
             try {
-                const metadata = await this.downloader.download(url);
-
-                await this.notifier.sendPost(metadata, url);
+                await processTask.execute(url);
 
                 console.log(`[Job ${job.id}] Completed successfully.`);
                 return { success: true };
