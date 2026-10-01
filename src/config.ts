@@ -23,5 +23,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
         cookiesPath: env.COOKIES_PATH || './cookies.txt',
         downloadPath: env.DOWNLOAD_PATH || './downloads',
         downloadTimeoutMs: integer('DOWNLOAD_TIMEOUT_MS', 600_000, 2_147_483_647),
+        shutdownTimeoutMs: integer('SHUTDOWN_TIMEOUT_MS', 30_000, 600_000),
     };
 }

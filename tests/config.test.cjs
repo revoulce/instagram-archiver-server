@@ -8,13 +8,14 @@ test('configuration has numeric defaults and requires explicit credentials', () 
     assert.equal(config.port, 3000);
     assert.equal(config.redisPort, 6379);
     assert.equal(config.downloadTimeoutMs, 600000);
+    assert.equal(config.shutdownTimeoutMs, 30000);
     for (const name of Object.keys(required)) {
         assert.throws(() => loadConfig({ ...required, [name]: ' ' }), new RegExp(name));
     }
 });
 
 test('invalid port and timeout settings fail before services are started', () => {
-    for (const name of ['PORT', 'REDIS_PORT', 'DOWNLOAD_TIMEOUT_MS']) {
+    for (const name of ['PORT', 'REDIS_PORT', 'DOWNLOAD_TIMEOUT_MS', 'SHUTDOWN_TIMEOUT_MS']) {
         for (const value of ['', 'abc', '0', '-1', '1.5', 'Infinity']) {
             assert.throws(() => loadConfig({ ...required, [name]: value }), new RegExp(name));
         }

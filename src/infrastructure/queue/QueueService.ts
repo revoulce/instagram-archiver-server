@@ -102,8 +102,8 @@ export class QueueService implements ITaskQueue {
 
     async isReady(): Promise<boolean> {
         if (!this.worker.isRunning()) return false;
-        const client = await this.queue.client;
-        if (client.status !== 'ready') return false;
+        const [client, workerClient] = await Promise.all([this.queue.client, this.worker.client]);
+        if (client.status !== 'ready' || workerClient.status !== 'ready') return false;
         await this.queue.getJobCounts('waiting');
         return true;
     }

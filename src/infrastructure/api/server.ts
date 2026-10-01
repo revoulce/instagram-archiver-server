@@ -2,13 +2,43 @@ import express, { Request, Response, NextFunction } from 'express';
 import { ITaskQueue } from '../../domain/interfaces';
 import { normalizeInstagramUrl } from '../../domain/instagramUrl';
 
-export const createServer = (queue: ITaskQueue, secret: string) => {
+interface HealthOptions {
+    isReady(): Promise<boolean>;
+    isStopping(): boolean;
+    timeoutMs?: number;
+}
+
+export const createServer = (queue: ITaskQueue, secret: string, health?: HealthOptions) => {
     const app = express();
+
+    app.get('/health/live', (_req, res) => res.json({ status: 'alive' }));
+    app.get('/health/ready', async (_req, res) => {
+        if (!health || health.isStopping()) {
+            res.status(503).json({ status: 'unavailable' });
+            return;
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            const ready = await Promise.race([
+                health.isReady(),
+                new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), health.timeoutMs ?? 2000); }),
+            ]);
+            res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'unavailable' });
+        } catch {
+            res.status(503).json({ status: 'unavailable' });
+        } finally {
+            clearTimeout(timer);
+        }
+    });
 
     app.use((req: Request, res: Response, next: NextFunction) => {
         const authHeader = req.headers['authorization'];
         if (authHeader !== secret) {
             res.status(403).json({ error: 'Forbidden' });
+            return;
+        }
+        if (health?.isStopping()) {
+            res.status(503).json({ error: 'Server is shutting down' });
             return;
         }
         next();

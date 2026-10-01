@@ -1,0 +1,33 @@
+name: Server checks
+on:
+  push:
+    branches: [master, main, develop]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+        env:
+          TEST_REDIS_HOST: 127.0.0.1
+          TEST_REDIS_PORT: 6379
+      - run: docker build -t instagram-archiver-server:ci .

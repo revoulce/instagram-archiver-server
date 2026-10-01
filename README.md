@@ -13,7 +13,7 @@
 
 ## 🛠 Технический стек
 
-*   **Runtime:** Node.js v20 (Alpine/Slim)
+*   **Runtime:** Node.js v24 LTS (Debian Slim)
 *   **Language:** TypeScript
 *   **Downloader:** [gallery-dl](https://github.com/mikf/gallery-dl) (Python)
 *   **Queue:** BullMQ & Redis
@@ -46,7 +46,7 @@ REDIS_PORT=6379
 DOWNLOAD_TIMEOUT_MS=600000
 ```
 
-`AUTH_SECRET`, `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHANNEL_ID` обязательны. Сервер проверяет настройки до подключения к Redis; запасного ключа доступа нет. `DOWNLOAD_TIMEOUT_MS` ограничивает каждый запуск `gallery-dl` отдельно.
+`AUTH_SECRET`, `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHANNEL_ID` обязательны. Сервер проверяет настройки до подключения к Redis; запасного ключа доступа нет. `DOWNLOAD_TIMEOUT_MS` ограничивает каждый запуск `gallery-dl` отдельно. `SHUTDOWN_TIMEOUT_MS` задаёт срок завершения активной задачи при остановке (по умолчанию 30 секунд).
 
 Пример для локального запуска находится в `.env.example`. В Docker путь `/app` соответствует рабочему каталогу контейнера. Боту нужны права публикации в выбранном Telegram-канале.
 
@@ -61,6 +61,10 @@ docker compose logs -f app
 
 Cookies и скачанные файлы исключены из Git и Docker build context. Файл cookies подключается в контейнер только для чтения.
 
+Контейнер приложения работает от пользователя `node` (UID 1000). На Linux обеспечьте этому пользователю чтение `cookies.txt` и запись в каталог `downloads` на хосте. Runtime-образ содержит только production-зависимости Node.js; `gallery-dl` версии 1.32.14 установлен в отдельное Python-окружение. Версию можно изменить через build argument `GALLERY_DL_VERSION` после проверки совместимости.
+
+Redis использует AOF (`appendfsync everysec`) и политику `noeviction`. Compose ждёт успешного healthcheck Redis перед запуском приложения. AOF уменьшает потери при перезапуске, но не исключает потерю последних записей при аварии; сохраняйте резервные копии Redis и downloads.
+
 ### API
 
 `POST /api/v1/task` принимает JSON `{"url":"https://www.instagram.com/p/ABC/"}`. Передавайте ключ `AUTH_SECRET` в заголовке `Authorization` без префикса. Ответ `{"status":"queued","jobId":"42"}` означает приём задачи в очередь, а не завершение публикации.
@@ -74,6 +78,14 @@ npm ci
 npm run build
 npm test
 ```
+
+В GitHub Actions эти команды выполняются на Node.js 24 с Redis 7.4, затем проверяется сборка Docker-образа. Интеграционный тест очереди запускается при наличии `TEST_REDIS_HOST` (и необязательного `TEST_REDIS_PORT`, по умолчанию 6379). Он использует уникальный временный namespace Redis и удаляет только свои задачи; Instagram и Telegram заменены имитациями. Без этой переменной интеграционный тест пропускается.
+
+### Готовность и остановка
+
+Публичный `GET /health/live` показывает, что HTTP-процесс отвечает. `GET /health/ready` возвращает `200`, когда worker запущен и Redis доступен, иначе `503`; проверка ограничена двумя секундами. Эти endpoints не раскрывают настройки, данные задач или причины внутренних ошибок. Остальной API требует `Authorization`.
+
+При SIGTERM/SIGINT сервер прекращает приём задач, закрывает HTTP и ждёт завершения активного worker. По истечении `SHUTDOWN_TIMEOUT_MS` процесс завершается с кодом 1; при следующем запуске сохранённый прогресс предотвращает повтор подтверждённых пакетов, а незавершённая отправка требует проверки. Если увеличиваете срок остановки, также увеличьте `stop_grace_period` в Compose (сейчас 45 секунд).
 
 Тесты проверяют HTTP API, конфигурацию, подписи и разбиение альбомов Telegram, а также очистку каталогов задач. Они используют имитацию Telegram API и downloader; реальные Instagram, Telegram и Redis не требуются.
 

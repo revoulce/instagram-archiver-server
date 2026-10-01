@@ -3,10 +3,13 @@ services:
     build: .
     container_name: insta-archiver-app
     restart: always
+    init: true
+    stop_grace_period: 45s
     ports:
-      - "${PORT}:${PORT}"
+      - "${PORT:-3000}:${PORT:-3000}"
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     volumes:
       - ./cookies.txt:/app/cookies.txt:ro
       - ./downloads:/app/downloads
@@ -17,9 +20,15 @@ services:
       - REDIS_PORT=6379
 
   redis:
-    image: redis:alpine
+    image: redis:7.4-alpine
     container_name: insta-archiver-redis
     restart: always
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     volumes:
       - redis_data:/data
 
