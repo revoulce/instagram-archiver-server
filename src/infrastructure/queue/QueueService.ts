@@ -62,9 +62,15 @@ export class QueueService implements ITaskQueue {
     }
 
     async getStatus(id: string): Promise<TaskStatus | null> {
-        const job = await this.queue.getJob(id);
+        let job = await this.queue.getJob(id);
         if (!job) return null;
         const state = await job.getState();
+        // The worker can persist its final checkpoint after getJob but before getState.
+        // Once a terminal state is observed, reload the snapshot that preceded it.
+        if (state === 'completed' || state === 'failed') {
+            job = await this.queue.getJob(id);
+            if (!job) return null;
+        }
         const status: TaskStatus['status'] = state === 'active' ? 'processing'
             : state === 'delayed' ? 'retrying'
             : state === 'completed' || state === 'failed' ? state
@@ -85,9 +91,13 @@ export class QueueService implements ITaskQueue {
     }
 
     async retry(id: string): Promise<'queued' | 'not_found' | 'conflict' | 'requires_review'> {
-        const job = await this.queue.getJob(id);
+        let job = await this.queue.getJob(id);
         if (!job) return 'not_found';
         if (await job.getState() !== 'failed') return 'conflict';
+        // Do not decide whether delivery is safe using a snapshot read while the
+        // previous attempt was still running.
+        job = await this.queue.getJob(id);
+        if (!job) return 'not_found';
         if (requiresDeliveryReview(job.data.checkpoint)) return 'requires_review';
         try {
             await job.retry('failed', { resetAttemptsMade: true, resetAttemptsStarted: true });

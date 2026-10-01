@@ -61,3 +61,32 @@ test('manual retry rejects active, completed and uncertain jobs and renews safe 
     queue.queue.getJob = async () => undefined;
     assert.equal(await queue.retry('missing'), 'not_found');
 });
+
+test('terminal status reloads the final checkpoint if the worker completes between reads', async () => {
+    const queue = Object.create(QueueService.prototype);
+    const initial = {
+        id: '42', data: { url: 'url', checkpoint: { nextFileIndex: 10, messageIds: [1] } },
+        attemptsMade: 1, timestamp: 1000, getState: async () => 'completed',
+    };
+    const final = {
+        ...initial, data: { url: 'url', checkpoint: { nextFileIndex: 11, messageIds: [1,11] } },
+        attemptsMade: 2, finishedOn: 2000,
+    };
+    let reads = 0;
+    queue.queue = { getJob: async () => ++reads === 1 ? initial : final };
+    const status = await queue.getStatus('42');
+    assert.equal(status.sentFiles, 11);
+    assert.equal(status.attemptsMade, 2);
+    assert.deepEqual(status.messageIds, [1,11]);
+});
+
+test('retry reloads the failed checkpoint before allowing another delivery attempt', async () => {
+    const queue = Object.create(QueueService.prototype);
+    let reads = 0;
+    let retried = false;
+    const initial = { data: {}, getState: async () => 'failed', retry: async () => { retried = true; } };
+    const final = { ...initial, data: { checkpoint: { pendingFileIndex: 10 } } };
+    queue.queue = { getJob: async () => ++reads === 1 ? initial : final };
+    assert.equal(await queue.retry('42'), 'requires_review');
+    assert.equal(retried, false);
+});
