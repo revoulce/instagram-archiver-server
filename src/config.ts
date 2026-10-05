@@ -24,5 +24,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
         downloadPath: env.DOWNLOAD_PATH || './downloads',
         downloadTimeoutMs: integer('DOWNLOAD_TIMEOUT_MS', 600_000, 2_147_483_647),
         shutdownTimeoutMs: integer('SHUTDOWN_TIMEOUT_MS', 30_000, 600_000),
+        instagramMinIntervalMs: integer('INSTAGRAM_MIN_INTERVAL_MS', 60_000, 2_147_483_647),
+        instagramRequestIntervalSeconds: integer('INSTAGRAM_REQUEST_INTERVAL_SECONDS', 10, 3600),
+        instagramRateLimitCooldownMs: integer('INSTAGRAM_RATE_LIMIT_COOLDOWN_MS', 3_600_000, 2_147_483_647),
+        instagramCookiesPollMs: integer('INSTAGRAM_COOKIES_POLL_MS', 30_000, 600_000),
     };
 }

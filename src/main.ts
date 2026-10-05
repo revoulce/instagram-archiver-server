@@ -13,7 +13,8 @@ const config = loadConfig();
 const downloader = new GalleryDLService(
     config.cookiesPath,
     config.downloadPath,
-    config.downloadTimeoutMs
+    config.downloadTimeoutMs,
+    config.instagramRequestIntervalSeconds
 );
 
 const notifier = new GrammyService(
@@ -25,7 +26,13 @@ const queueService = new QueueService(
     config.redisHost,
     config.redisPort,
     downloader,
-    notifier
+    notifier,
+    'instagram-tasks',
+    {
+        minIntervalMs: config.instagramMinIntervalMs,
+        rateLimitCooldownMs: config.instagramRateLimitCooldownMs,
+        cookiesPollMs: config.instagramCookiesPollMs,
+    }
 );
 
 let stopping = false;

@@ -9,13 +9,18 @@ test('configuration has numeric defaults and requires explicit credentials', () 
     assert.equal(config.redisPort, 6379);
     assert.equal(config.downloadTimeoutMs, 600000);
     assert.equal(config.shutdownTimeoutMs, 30000);
+    assert.equal(config.instagramMinIntervalMs, 60000);
+    assert.equal(config.instagramRequestIntervalSeconds, 10);
+    assert.equal(config.instagramRateLimitCooldownMs, 3600000);
+    assert.equal(config.instagramCookiesPollMs, 30000);
     for (const name of Object.keys(required)) {
         assert.throws(() => loadConfig({ ...required, [name]: ' ' }), new RegExp(name));
     }
 });
 
 test('invalid port and timeout settings fail before services are started', () => {
-    for (const name of ['PORT', 'REDIS_PORT', 'DOWNLOAD_TIMEOUT_MS', 'SHUTDOWN_TIMEOUT_MS']) {
+    for (const name of ['PORT', 'REDIS_PORT', 'DOWNLOAD_TIMEOUT_MS', 'SHUTDOWN_TIMEOUT_MS',
+        'INSTAGRAM_MIN_INTERVAL_MS', 'INSTAGRAM_REQUEST_INTERVAL_SECONDS', 'INSTAGRAM_RATE_LIMIT_COOLDOWN_MS', 'INSTAGRAM_COOKIES_POLL_MS']) {
         for (const value of ['', 'abc', '0', '-1', '1.5', 'Infinity']) {
             assert.throws(() => loadConfig({ ...required, [name]: value }), new RegExp(name));
         }

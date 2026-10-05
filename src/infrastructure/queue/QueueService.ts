@@ -1,18 +1,23 @@
-import { Queue, Worker, Job, UnrecoverableError } from 'bullmq';
+import { Queue, Worker, Job, UnrecoverableError, DelayedError } from 'bullmq';
 import { ITaskQueue, IDownloader, INotifier } from '../../domain/interfaces';
 import { DownloadTask, TaskCheckpoint, TaskStatus } from '../../domain/entities';
 import { normalizeInstagramUrl } from '../../domain/instagramUrl';
 import { taskIdentity, requiresDeliveryReview } from '../../domain/taskIdentity';
-import { PermanentTaskError, TelegramRateLimitError } from '../../domain/taskErrors';
+import { PermanentTaskError, TelegramRateLimitError, InstagramRestrictionError, InstagramWaitError, InstagramWaitReason } from '../../domain/taskErrors';
 import { ProcessTask } from '../../application/ProcessTask';
+import { InstagramSessionGate, InstagramQueueOptions } from './InstagramSessionGate';
 
-type TaskData = Pick<DownloadTask, 'url' | 'source'> & { checkpoint?: TaskCheckpoint };
+type TaskData = Pick<DownloadTask, 'url' | 'source'> & {
+    checkpoint?: TaskCheckpoint;
+    instagramWait?: { reason: InstagramWaitReason; checkAt: number };
+};
 
 export class QueueService implements ITaskQueue {
     private queue: Queue<TaskData>;
     private worker: Worker<TaskData>;
+    private startup: Promise<void>;
 
-    constructor(redisHost: string, redisPort: number, downloader: IDownloader, notifier: INotifier, namespace = 'instagram-tasks') {
+    constructor(redisHost: string, redisPort: number, downloader: IDownloader, notifier: INotifier, namespace = 'instagram-tasks', options: InstagramQueueOptions = {}) {
         const connection = { host: redisHost, port: redisPort };
         // HTTP requests fail promptly while the worker keeps reconnecting in the background.
         this.queue = new Queue<TaskData>(namespace, {
@@ -24,10 +29,27 @@ export class QueueService implements ITaskQueue {
                 removeOnFail: { age: 604800, count: 5000 },
             },
         });
-        const processTask = new ProcessTask(downloader, notifier);
-        this.worker = new Worker<TaskData>(namespace, async (job: Job<TaskData>) => {
-            console.log(`[Job ${job.id}] Processing: ${job.data.url}`);
+        const gate = new InstagramSessionGate(() => this.queue.client, this.queue.toKey('instagram-session'), options);
+        const processTask = new ProcessTask({
+            download: async url => {
+                const fingerprint = downloader.getSessionFingerprint ? await downloader.getSessionFingerprint() : 'anonymous';
+                await gate.reserve(fingerprint);
+                try { return await downloader.download(url, fingerprint ?? undefined); }
+                catch (error) {
+                    if (error instanceof InstagramRestrictionError) {
+                        const waiting = await gate.restrict(error);
+                        console.warn(`[Instagram] Downloads paused: ${error.reason}. ${error.reason === 'rate_limited' ? 'Waiting for cooldown.' : 'Replace cookies.txt with a new login session.'}`);
+                        throw waiting;
+                    }
+                    throw error;
+                }
+            },
+            cleanup: metadata => downloader.cleanup(metadata),
+            isAvailable: metadata => downloader.isAvailable(metadata),
+        }, notifier);
+        this.worker = new Worker<TaskData>(namespace, async (job: Job<TaskData>, token?: string) => {
             try {
+                if (job.data.instagramWait) await job.updateData({ ...job.data, instagramWait: undefined });
                 await processTask.execute(job.data.url, {
                     checkpoint: job.data.checkpoint,
                     finalAttempt: job.attemptsMade + 1 >= (job.opts.attempts ?? 1),
@@ -37,12 +59,19 @@ export class QueueService implements ITaskQueue {
                 });
                 return { success: true };
             } catch (error) {
+                if (error instanceof InstagramWaitError) {
+                    const checkAt = Date.now() + error.delayMs;
+                    await job.updateData({ ...job.data, instagramWait: { reason: error.reason, checkAt } });
+                    await job.moveToDelayed(checkAt, token);
+                    throw new DelayedError();
+                }
                 console.error(`[Job ${job.id}] Failed:`, error instanceof Error ? error.message : 'Unknown error');
                 if (error instanceof PermanentTaskError) throw new UnrecoverableError(error.message);
                 throw error;
             }
         }, {
             connection: { ...connection, maxRetriesPerRequest: null },
+            autorun: false,
             concurrency: 1,
             settings: {
                 backoffStrategy: (attemptsMade, _type, error) =>
@@ -51,6 +80,14 @@ export class QueueService implements ITaskQueue {
         });
         this.queue.on('error', error => console.error('Queue connection error:', error.message));
         this.worker.on('error', error => console.error('Worker error:', error.message));
+        // Serialise replicas sharing this queue, not just this worker process.
+        this.startup = this.worker.client.then(async client => {
+            // The worker connection keeps reconnecting if Redis is unavailable
+            // at startup; the HTTP queue connection intentionally fails fast.
+            await client.hset(this.queue.toKey('meta'), { concurrency: 1 });
+            void this.worker.run().catch(error => console.error('Worker stopped:', error.message));
+        });
+        this.startup.catch(error => console.error('Queue startup failed:', error.message));
     }
 
     async add(taskData: Pick<DownloadTask, 'url' | 'source'>): Promise<string> {
@@ -86,6 +123,10 @@ export class QueueService implements ITaskQueue {
             totalFiles: checkpoint?.metadata?.filePaths.length ?? null,
             messageIds: checkpoint?.messageIds ?? [],
             requiresReview,
+            ...(status === 'retrying' && job.data.instagramWait ? {
+                waitingReason: job.data.instagramWait.reason,
+                nextCheckAt: new Date(job.data.instagramWait.checkAt).toISOString(),
+            } : {}),
             ...(status === 'failed' ? { error: requiresReview ? 'Check Telegram before sending this post again.' : 'Task failed. Check server logs or retry.' } : {}),
         };
     }
@@ -119,11 +160,13 @@ export class QueueService implements ITaskQueue {
     }
 
     async close(): Promise<void> {
+        await this.startup.catch(() => {});
         await this.worker.close();
         await this.queue.close();
     }
 
     async waitUntilReady(): Promise<void> {
+        await this.startup;
         await Promise.all([this.queue.waitUntilReady(), this.worker.waitUntilReady()]);
     }
 }

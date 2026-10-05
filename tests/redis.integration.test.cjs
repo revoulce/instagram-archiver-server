@@ -31,7 +31,7 @@ test('Redis integration: atomic duplicate suppression, persisted status and safe
             }
             await options.onBatchSent(1, [sends]);
         }, sendError: async () => {},
-    }, namespace);
+    }, namespace, { minIntervalMs: 1 });
     t.after(async () => {
         release();
         await service.close();
@@ -85,7 +85,7 @@ async function albumFixture(t, sendPost) {
     };
     let current;
     const connect = async notifier => {
-        current = new QueueService(host, port, downloader, { sendPost: notifier, sendError: async () => {} }, namespace);
+        current = new QueueService(host, port, downloader, { sendPost: notifier, sendError: async () => {} }, namespace, { minIntervalMs: 1 });
         await current.waitUntilReady();
         return current;
     };

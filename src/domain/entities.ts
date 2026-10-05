@@ -37,4 +37,6 @@ export interface TaskStatus {
     messageIds: number[];
     requiresReview: boolean;
     error?: string;
+    waitingReason?: import('./taskErrors').InstagramWaitReason;
+    nextCheckAt?: string;
 }

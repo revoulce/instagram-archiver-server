@@ -90,3 +90,15 @@ test('retry reloads the failed checkpoint before allowing another delivery attem
     assert.equal(await queue.retry('42'), 'requires_review');
     assert.equal(retried, false);
 });
+
+test('Instagram waits expose a reason and next local check without exposing the session', async () => {
+    const queue = Object.create(QueueService.prototype);
+    queue.queue = { getJob: async () => ({ id: '42', data: { url: 'url',
+        instagramWait: { reason: 'auth_required', checkAt: 5000 } },
+        attemptsMade: 0, timestamp: 1000, getState: async () => 'delayed' }) };
+    const status = await queue.getStatus('42');
+    assert.equal(status.status, 'retrying');
+    assert.equal(status.waitingReason, 'auth_required');
+    assert.equal(status.nextCheckAt, new Date(5000).toISOString());
+    assert.equal(status.attemptsMade, 0);
+});

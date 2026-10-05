@@ -5,89 +5,98 @@ import * as path from 'path';
 import { IDownloader } from '../../domain/interfaces';
 import { MediaMetadata } from '../../domain/entities';
 import { randomUUID } from 'crypto';
+import { InstagramRestrictionError, InstagramWaitError } from '../../domain/taskErrors';
+import { classifyInstagramFailure, sessionFingerprint } from './instagramSession';
 
 const execFileAsync = promisify(execFile);
+type GalleryRunner = (args: string[], options: { maxBuffer: number; timeout: number }) => Promise<{ stdout: string; stderr: string }>;
 
 export class GalleryDLService implements IDownloader {
-    private cookiesPath: string;
     private downloadBasePath: string;
 
-    constructor(cookiesPath: string, downloadBasePath: string, private timeoutMs = 600_000) {
-        this.cookiesPath = cookiesPath;
+    constructor(
+        private cookiesPath: string,
+        downloadBasePath: string,
+        private timeoutMs = 600_000,
+        private requestIntervalSeconds = 10,
+        private runGallery: GalleryRunner = (args, options) => execFileAsync('gallery-dl', args, options),
+    ) {
         this.downloadBasePath = path.resolve(downloadBasePath);
     }
 
-    async download(url: string): Promise<MediaMetadata> {
-        const taskId = randomUUID();
-        const taskDir = path.join(this.downloadBasePath, taskId);
+    async getSessionFingerprint(): Promise<string | null> {
+        try { return sessionFingerprint(await fs.readFile(this.cookiesPath, 'utf8')); }
+        catch { return null; }
+    }
+
+    async download(url: string, expectedSessionFingerprint?: string): Promise<MediaMetadata> {
+        const taskDir = path.join(this.downloadBasePath, randomUUID());
+        const cookieSnapshot = path.join(taskDir, '.cookies.txt');
         await fs.mkdir(taskDir, { recursive: true });
 
         try {
-            console.log(`[GalleryDL] Fetching metadata for: ${url}`);
-
-            const { stdout: metaStdout } = await execFileAsync('gallery-dl', [
-                '--cookies', this.cookiesPath,
-                '--dump-json',
-                '--no-download',
-                url
-            ], { maxBuffer: 1024 * 1024 * 50, timeout: this.timeoutMs });
-
-            let metaRaw: any = null;
-
+            let contents: string;
+            try { contents = await fs.readFile(this.cookiesPath, 'utf8'); }
+            catch { throw new InstagramRestrictionError('cookies_required', ''); }
+            const fingerprint = sessionFingerprint(contents) ?? '';
+            if (!fingerprint) throw new InstagramRestrictionError('cookies_required', '');
+            // Admit replacement cookies through the shared gate before using them.
+            if (expectedSessionFingerprint && expectedSessionFingerprint !== fingerprint) {
+                throw new InstagramWaitError('pacing', 1000);
+            }
+            await fs.writeFile(cookieSnapshot, contents, { mode: 0o600 });
+            console.log(`[GalleryDL] Downloading: ${url}`);
+            let stderr: string;
             try {
-                const fullJson = JSON.parse(metaStdout);
-                metaRaw = this.findMetadataInJson(fullJson);
-            } catch (e) {
-                const lines = metaStdout.split('\n').filter(l => l.trim().length > 0);
-                for (const line of lines) {
-                    try {
-                        const json = JSON.parse(line);
-                        const found = this.findMetadataInJson(json);
-                        if (found) {
-                            metaRaw = found;
-                            break;
-                        }
-                    } catch (ignore) {}
-                }
+                ({ stderr } = await this.runGallery([
+                    '--config-ignore', '--no-input', '--no-colors',
+                    '--cookies', cookieSnapshot,
+                    '--directory', taskDir,
+                    '--filename', '{num:04}_{media_id}.{extension}',
+                    '--write-metadata', '--retries', '0',
+                    '--sleep-request', String(this.requestIntervalSeconds),
+                    '-o', 'extractor.instagram.sleep-429=0', url,
+                ], { maxBuffer: 1024 * 1024 * 50, timeout: this.timeoutMs }));
+            } catch (error) {
+                const failure = error as { stderr?: string; killed?: boolean };
+                const restriction = classifyInstagramFailure(failure.stderr ?? '', fingerprint);
+                if (restriction) throw restriction;
+                // execFile errors include raw API fragments and signed URLs.
+                throw new Error(failure.killed ? 'Instagram download timed out' : 'gallery-dl download failed');
             }
-
-            if (!metaRaw) {
-                throw new Error('Could not find valid metadata in gallery-dl output');
-            }
-
-            console.log(`[GalleryDL] Metadata found (Author: ${metaRaw.username}). Downloading...`);
-
-            await execFileAsync('gallery-dl', [
-                '--cookies', this.cookiesPath,
-                '--directory', taskDir,
-                url
-            ], { maxBuffer: 1024 * 1024 * 50, timeout: this.timeoutMs });
+            const restriction = classifyInstagramFailure(stderr, fingerprint);
+            if (restriction) throw restriction;
 
             const files = await fs.readdir(taskDir, { withFileTypes: true });
             const filePaths = files
                 .filter(file => file.isFile() && /\.(jpe?g|png|webp|mp4)$/i.test(file.name))
-                .map(file => path.join(taskDir, file.name));
+                .map(file => path.join(taskDir, file.name)).sort();
+            if (!filePaths.length) throw new Error('Gallery-dl finished but no files were found');
 
-            if (filePaths.length === 0) {
-                throw new Error('Gallery-dl finished but no files were found.');
+            // Sidecars are produced by the same extraction as their media files.
+            // Require complete metadata to avoid publishing a partial album.
+            const metadata = await Promise.all(filePaths.map(async file => JSON.parse(await fs.readFile(`${file}.json`, 'utf8'))));
+            const first = metadata[0];
+            if (!first.username || !first.post_id ||
+                metadata.some(item => item.post_id !== first.post_id || item.count !== filePaths.length) ||
+                new Set(metadata.map(item => item.num)).size !== filePaths.length) {
+                throw new Error('Gallery-dl returned incomplete or inconsistent post metadata');
             }
-
-            const isVideo = filePaths.some(f => path.extname(f).toLowerCase() === '.mp4');
-            const mediaType = filePaths.length > 1 ? 'album' : (isVideo ? 'video' : 'image');
-
+            const isVideo = filePaths.some(file => path.extname(file).toLowerCase() === '.mp4');
             return {
                 downloadDirectory: taskDir,
-                description: metaRaw.description || metaRaw.caption || '',
-                author: metaRaw.fullname || metaRaw.username || 'unknown',
-                likes: metaRaw.likes || 0,
-                uploadDate: metaRaw.date || new Date().toISOString(),
-                filePaths: filePaths,
-                mediaType: mediaType
+                description: first.description || first.caption || '',
+                author: first.fullname || first.username || 'unknown',
+                likes: first.likes || 0,
+                uploadDate: first.date || new Date().toISOString(),
+                filePaths,
+                mediaType: filePaths.length > 1 ? 'album' : isVideo ? 'video' : 'image',
             };
-
         } catch (error) {
             await fs.rm(taskDir, { recursive: true, force: true }).catch(() => {});
             throw error;
+        } finally {
+            await fs.rm(cookieSnapshot, { force: true }).catch(() => {});
         }
     }
 
@@ -108,30 +117,6 @@ export class GalleryDLService implements IDownloader {
                 if (path.dirname(path.resolve(file)) !== directory || !(await fs.lstat(file)).isFile()) return false;
             }
             return true;
-        } catch {
-            return false;
-        }
-    }
-
-    private findMetadataInJson(obj: any): any {
-        if (!obj || typeof obj !== 'object') return null;
-
-        if (obj.username && (obj.description !== undefined || obj.likes !== undefined || obj.post_id !== undefined)) {
-            return obj;
-        }
-
-        if (Array.isArray(obj)) {
-            for (const item of obj) {
-                const found = this.findMetadataInJson(item);
-                if (found) return found;
-            }
-        } else {
-            for (const key in obj) {
-                const found = this.findMetadataInJson(obj[key]);
-                if (found) return found;
-            }
-        }
-
-        return null;
+        } catch { return false; }
     }
 }

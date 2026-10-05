@@ -1,7 +1,8 @@
 import { DownloadTask, MediaMetadata, TaskCheckpoint, TaskStatus } from './entities';
 
 export interface IDownloader {
-    download(url: string): Promise<MediaMetadata>;
+    download(url: string, expectedSessionFingerprint?: string): Promise<MediaMetadata>;
+    getSessionFingerprint?(): Promise<string | null>;
     cleanup(metadata: MediaMetadata): Promise<void>;
     isAvailable(metadata: MediaMetadata): Promise<boolean>;
 }
