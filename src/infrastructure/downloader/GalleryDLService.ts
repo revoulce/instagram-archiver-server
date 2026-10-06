@@ -32,6 +32,7 @@ export class GalleryDLService implements IDownloader {
     async download(url: string, expectedSessionFingerprint?: string): Promise<MediaMetadata> {
         const taskDir = path.join(this.downloadBasePath, randomUUID());
         const cookieSnapshot = path.join(taskDir, '.cookies.txt');
+        const mediaManifest = path.join(taskDir, '.media-manifest');
         await fs.mkdir(taskDir, { recursive: true });
 
         try {
@@ -54,6 +55,7 @@ export class GalleryDLService implements IDownloader {
                     '--directory', taskDir,
                     '--filename', '{num:04}_{media_id}.{extension}',
                     '--write-metadata', '--retries', '0',
+                    '--Print-to-file', 'prepare:{post_id}_{media_id}', mediaManifest,
                     '--sleep-request', String(this.requestIntervalSeconds),
                     '-o', 'extractor.instagram.sleep-429=0', url,
                 ], { maxBuffer: 1024 * 1024 * 50, timeout: this.timeoutMs }));
@@ -74,14 +76,30 @@ export class GalleryDLService implements IDownloader {
             if (!filePaths.length) throw new Error('Gallery-dl finished but no files were found');
 
             // Sidecars are produced by the same extraction as their media files.
-            // Require complete metadata to avoid publishing a partial album.
+            // gallery-dl's count includes background music even when audio=false.
+            // Record every emitted media ID before download in the same pass and
+            // require its matching file/sidecar, rather than counting skipped audio.
             const metadata = await Promise.all(filePaths.map(async file => JSON.parse(await fs.readFile(`${file}.json`, 'utf8'))));
             const first = metadata[0];
-            if (!first.username || !first.post_id ||
-                metadata.some(item => item.post_id !== first.post_id || item.count !== filePaths.length) ||
-                new Set(metadata.map(item => item.num)).size !== filePaths.length) {
-                throw new Error('Gallery-dl returned incomplete or inconsistent post metadata');
+            const invalid = (reason: string): never => {
+                throw new Error(`Gallery-dl returned incomplete or inconsistent post metadata (${reason})`);
+            };
+            if (!first?.username || !first.post_id) invalid('missing post identity');
+            if (!Number.isSafeInteger(first.count) || first.count < filePaths.length ||
+                metadata.some(item => !item || item.post_id !== first.post_id || item.count !== first.count)) {
+                invalid('inconsistent post identity or count');
             }
+            if (/Missing media in post/i.test(stderr)) invalid('missing source media');
+            const plannedMedia = (await fs.readFile(mediaManifest, 'utf8')).trim().split(/\r?\n/);
+            const downloadedMedia = new Set(metadata.map(item => `${item.post_id}_${item.media_id}`));
+            if (metadata.some(item => !item.media_id) || downloadedMedia.size !== filePaths.length ||
+                plannedMedia.length !== filePaths.length || new Set(plannedMedia).size !== plannedMedia.length ||
+                plannedMedia.some(id => !downloadedMedia.has(id))) {
+                invalid('media manifest mismatch');
+            }
+            // Allow an omitted num for a singleton. Albums must contain 1..N.
+            const positions = metadata.map(item => item.num ?? (filePaths.length === 1 ? 1 : undefined));
+            if (positions.some((num, index) => num !== index + 1)) invalid('invalid media order');
             const isVideo = filePaths.some(file => path.extname(file).toLowerCase() === '.mp4');
             return {
                 downloadDirectory: taskDir,

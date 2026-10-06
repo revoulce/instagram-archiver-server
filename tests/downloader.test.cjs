@@ -19,6 +19,19 @@ async function fixture(t, run) {
     return { base, cookies, downloads, service: new GalleryDLService(cookies, downloads, 12345, 10, run) };
 }
 
+async function writeMedia(args, items, planned = items) {
+    const directory = args[args.indexOf('--directory') + 1];
+    const manifestOption = args.indexOf('--Print-to-file');
+    assert.ok(manifestOption >= 0);
+    assert.equal(args[manifestOption + 1], 'prepare:{post_id}_{media_id}');
+    await fs.writeFile(args[manifestOption + 2], planned.map(item => `${item.post_id}_${item.media_id}\n`).join(''));
+    for (const item of items) {
+        const file = path.join(directory, `${String(item.num ?? 'None').padStart(4, '0')}_${item.media_id}.${item.extension ?? 'jpg'}`);
+        await fs.writeFile(file, 'media');
+        await fs.writeFile(`${file}.json`, JSON.stringify(item));
+    }
+}
+
 test('session identity only changes with a valid new Instagram session', () => {
     const initial = sessionFingerprint(cookie('session-a'));
     assert.match(initial, /^[a-f0-9]{64}$/);
@@ -58,12 +71,10 @@ test('single-pass downloader preserves album order and reads matching metadata s
         assert.equal(args[args.indexOf('--sleep-request') + 1], '10');
         assert.equal(options.timeout, 12345);
         // Creation order and media IDs do not define album order.
-        for (const [num, id] of [[2, '100'], [1, '999']]) {
-            const file = path.join(directory, `${String(num).padStart(4, '0')}_${id}.jpg`);
-            await fs.writeFile(file, 'media');
-            await fs.writeFile(`${file}.json`, JSON.stringify({ num, count: 2, post_id: 'post',
-                username: 'author', fullname: 'Author', description: 'caption', likes: 5, date: '2026-10-05' }));
-        }
+        await writeMedia(args, [[2, '100'], [1, '999']].map(([num, media_id]) => ({
+            num, media_id, count: 2, post_id: 'post', username: 'author',
+            fullname: 'Author', description: 'caption', likes: 5, date: '2026-10-05',
+        })));
         return { stdout: '', stderr: '' };
     });
     const metadata = await f.service.download(url, await f.service.getSessionFingerprint());
@@ -73,6 +84,56 @@ test('single-pass downloader preserves album order and reads matching metadata s
     assert.equal(metadata.mediaType, 'album');
     assert.equal(metadata.likes, 5);
     await assert.rejects(fs.stat(path.join(metadata.downloadDirectory, '.cookies.txt')), { code: 'ENOENT' });
+});
+
+test('music-inclusive counts accept complete reels, photos, albums and stories', async t => {
+    for (const [extension, positions, type] of [
+        ['mp4', [1], 'video'], ['jpg', [1], 'image'],
+        ['jpg', [1, 2], 'album'], ['jpg', [1, 2, 3], 'album'],
+    ]) {
+        const f = await fixture(t, async args => {
+            await writeMedia(args, positions.map(num => ({ num, media_id: String(100 + num),
+                count: positions.length + 2, post_id: 'post', username: 'author', extension })));
+            return { stdout: '', stderr: '' };
+        });
+        const result = await f.service.download(url);
+        assert.equal(result.filePaths.length, positions.length);
+        assert.equal(result.mediaType, type);
+    }
+});
+
+test('singleton without num is accepted', async t => {
+    const f = await fixture(t, async args => {
+        await writeMedia(args, [{ media_id: '100', post_id: 'post', count: 1, username: 'author' }]);
+        return { stdout: '', stderr: '' };
+    });
+    assert.equal((await f.service.download(url)).mediaType, 'image');
+});
+
+test('manifest and metadata reject missing, duplicate, mismatched and out-of-order media', async t => {
+    const item = { num: 1, media_id: '100', post_id: 'post', count: 3, username: 'author' };
+    const second = { ...item, num: 2, media_id: '200' };
+    const cases = [
+        { items: [item], planned: [item, second] },
+        { items: [item], planned: [second] },
+        { items: [item, second], planned: [item, item] },
+        { items: [item, { ...second, media_id: item.media_id }] },
+        { items: [item, { ...second, post_id: 'other' }] },
+        { items: [item, { ...second, count: 2 }] },
+        { items: [item, { ...second, num: 3 }] },
+        { items: [{ ...item, num: 2 }] },
+        { items: [{ ...item, count: 0 }] },
+        { items: [{ ...item, username: '' }] },
+        { items: [item], stderr: '[instagram][warning] Missing media in post FIXTURE' },
+    ];
+    for (const scenario of cases) {
+        const f = await fixture(t, async args => {
+            await writeMedia(args, scenario.items, scenario.planned ?? scenario.items);
+            return { stdout: '', stderr: scenario.stderr ?? '' };
+        });
+        await assert.rejects(f.service.download(url), /incomplete or inconsistent/);
+        assert.deepEqual(await fs.readdir(f.downloads), []);
+    }
 });
 
 test('cookie replacement between admission and launch sends no request', async t => {
@@ -104,10 +165,8 @@ test('restriction after partial download discards media and keeps the original s
 
 test('incomplete album and failed process cannot be published or leak raw stderr', async t => {
     const f = await fixture(t, async args => {
-        const directory = args[args.indexOf('--directory') + 1];
-        const file = path.join(directory, '0001_fixture.jpg');
-        await fs.writeFile(file, 'partial');
-        await fs.writeFile(`${file}.json`, JSON.stringify({ num: 1, count: 2, post_id: 'post', username: 'a' }));
+        const item = { num: 1, media_id: '100', count: 2, post_id: 'post', username: 'a' };
+        await writeMedia(args, [item], [item, { ...item, num: 2, media_id: '200' }]);
         return { stdout: '', stderr: '' };
     });
     await assert.rejects(f.service.download(url), /incomplete/);
