@@ -5,6 +5,73 @@ const { Queue } = require('bullmq');
 const { QueueService } = require('../dist/infrastructure/queue/QueueService');
 const { PermanentTaskError, TelegramRateLimitError } = require('../dist/domain/taskErrors');
 
+test('Redis integration: metadata recovery runs on startup and interval with a shared restart cooldown', {
+    skip: !process.env.TEST_REDIS_HOST, timeout: 15000,
+}, async t => {
+    const host = process.env.TEST_REDIS_HOST;
+    const port = Number(process.env.TEST_REDIS_PORT || 6379);
+    const namespace = `archiver-test-${randomUUID()}`;
+    const control = new Queue(namespace, { connection: { host, port, maxRetriesPerRequest: 1 } });
+    const services = [];
+    const downloads = { META: 0, UNSAFE: 0, OTHER: 0 };
+    let sends = 0;
+    const metadata = { downloadDirectory: 'fixture', filePaths: ['image.jpg'], description: '', author: 'a', likes: 0, uploadDate: '', mediaType: 'image' };
+    const connect = async interval => {
+        const service = new QueueService(host, port, {
+            download: async url => {
+                const code = new URL(url).pathname.split('/')[2];
+                downloads[code]++;
+                if (code === 'OTHER') throw new PermanentTaskError('Fixture permanent failure');
+                if (code === 'UNSAFE' || downloads[code] < 3) {
+                    throw new Error('Gallery-dl returned incomplete or inconsistent post metadata');
+                }
+                return metadata;
+            }, cleanup: async () => {}, isAvailable: async () => true,
+        }, { sendPost: async (_metadata, _url, options) => {
+            await options.onBatchStart(0);
+            sends++;
+            await options.onBatchSent(1, [sends]);
+        }, sendError: async () => {} }, namespace, { minIntervalMs: 1, metadataRetryIntervalMs: interval });
+        services.push(service);
+        await service.waitUntilReady();
+        return service;
+    };
+    t.after(async () => {
+        await Promise.all(services.map(service => service.close()));
+        await (await control.client).del(control.toKey('metadata-auto-retry'), control.toKey('instagram-session'));
+        await control.obliterate({ force: true });
+        await control.close();
+    });
+    const waitFor = async predicate => {
+        const deadline = Date.now() + 6000;
+        while (Date.now() < deadline) {
+            if (await predicate()) return;
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        assert.fail('Metadata recovery did not reach expected state');
+    };
+    const first = await connect(0);
+    for (const code of Object.keys(downloads)) {
+        await control.add('download-post', { url: `https://www.instagram.com/p/${code}/`, source: 'extension' },
+            { jobId: code, attempts: 1 });
+        await waitFor(async () => (await control.getJob(code)).getState().then(state => state === 'failed'));
+    }
+    const unsafe = await control.getJob('UNSAFE');
+    await unsafe.updateData({ ...unsafe.data, checkpoint: { nextFileIndex: 0, messageIds: [], pendingFileIndex: 0 } });
+    await first.close();
+    await connect(1000);
+    await waitFor(async () => downloads.META === 2 && await (await control.getJob('META')).getState() === 'failed');
+    // A second container starts while the shared cooldown is still active.
+    await connect(1000);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(downloads.META, 2);
+    await waitFor(async () => await (await control.getJob('META')).getState() === 'completed');
+    assert.deepEqual(downloads, { META: 3, UNSAFE: 1, OTHER: 1 });
+    assert.equal(sends, 1);
+    assert.equal(await (await control.getJob('UNSAFE')).getState(), 'failed');
+    assert.equal(await (await control.getJob('OTHER')).getState(), 'failed');
+});
+
 test('Redis integration: atomic duplicate suppression, persisted status and safe manual retry', {
     skip: !process.env.TEST_REDIS_HOST, timeout: 30000,
 }, async t => {

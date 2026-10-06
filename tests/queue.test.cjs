@@ -102,3 +102,59 @@ test('Instagram waits expose a reason and next local check without exposing the 
     assert.equal(status.nextCheckAt, new Date(5000).toISOString());
     assert.equal(status.attemptsMade, 0);
 });
+
+test('automatic metadata recovery rechecks delivery state, failure generation and job state', async () => {
+    const service = Object.create(QueueService.prototype);
+    service.metadataRetryIntervalMs = 3600000;
+    const retryCalls = [];
+    const failedReason = 'Gallery-dl returned incomplete or inconsistent post metadata';
+    const job = (id, changes = {}) => ({ id, finishedOn: 1000, failedReason, data: {},
+        getState: async () => 'failed', retry: async (state, options) => {
+            assert.equal(state, 'failed');
+            assert.deepEqual(options, { resetAttemptsMade: true, resetAttemptsStarted: true });
+            retryCalls.push(id);
+        }, ...changes });
+    const candidates = [job('safe'), job('other', { failedReason: 'Telegram rejection' }),
+        job('uncertain', { data: { checkpoint: { pendingFileIndex: 0 } } }),
+        job('sent', { data: { checkpoint: { nextFileIndex: 10, messageIds: [1] } } }),
+        job('stale'), job('active'), job('deleted'), job('changed')];
+    const current = new Map(candidates.map(value => [value.id, value]));
+    current.set('stale', job('stale', { finishedOn: 2000 }));
+    current.set('active', job('active', { getState: async () => 'active' }));
+    current.delete('deleted');
+    current.set('changed', job('changed', { data: { checkpoint: { pendingFileIndex: 0 } } }));
+    let claimAllowed = true;
+    const client = { defineCommand: () => {}, runCommand: async () => claimAllowed ? 'OK' : null };
+    service.queue = { getFailed: async () => candidates, getJob: async id => current.get(id),
+        client: Promise.resolve(client), toKey: name => name };
+    assert.equal(await service.retryMetadataFailures(), 1);
+    assert.deepEqual(retryCalls, ['safe']);
+    claimAllowed = false;
+    assert.equal(await service.retryMetadataFailures(), 0);
+    assert.deepEqual(retryCalls, ['safe']);
+    service.metadataRetryIntervalMs = 0;
+    service.queue.getFailed = async () => assert.fail('Disabled recovery must not scan');
+    assert.equal(await service.retryMetadataFailures(), 0);
+});
+
+test('automatic recovery does not overlap scans and shutdown waits for an in-flight scan', async () => {
+    const service = Object.create(QueueService.prototype);
+    service.metadataRetryIntervalMs = 3600000;
+    let release;
+    let calls = 0;
+    service.queue = { getFailed: () => { calls++; return new Promise(resolve => { release = () => resolve([]); }); },
+        close: async () => {} };
+    let workerClosed = false;
+    service.worker = { close: async () => { workerClosed = true; } };
+    service.startup = Promise.resolve();
+    const first = service.retryMetadataFailures();
+    const second = service.retryMetadataFailures();
+    const closing = service.close();
+    assert.equal(calls, 1);
+    assert.equal(workerClosed, false);
+    release();
+    assert.deepEqual(await Promise.all([first, second]), [0, 0]);
+    await closing;
+    assert.equal(workerClosed, true);
+    assert.equal(await service.retryMetadataFailures(), 0);
+});

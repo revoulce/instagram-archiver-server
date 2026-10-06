@@ -32,6 +32,7 @@ const queueService = new QueueService(
         minIntervalMs: config.instagramMinIntervalMs,
         rateLimitCooldownMs: config.instagramRateLimitCooldownMs,
         cookiesPollMs: config.instagramCookiesPollMs,
+        metadataRetryIntervalMs: config.instagramMetadataRetryIntervalMs,
     }
 );
 

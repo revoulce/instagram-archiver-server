@@ -13,6 +13,9 @@ test('configuration has numeric defaults and requires explicit credentials', () 
     assert.equal(config.instagramRequestIntervalSeconds, 10);
     assert.equal(config.instagramRateLimitCooldownMs, 3600000);
     assert.equal(config.instagramCookiesPollMs, 30000);
+    assert.equal(config.instagramMetadataRetryIntervalMs, 3600000);
+    assert.equal(loadConfig({ ...required, INSTAGRAM_METADATA_RETRY_INTERVAL_MS: '0' }).instagramMetadataRetryIntervalMs, 0);
+    assert.equal(loadConfig({ ...required, INSTAGRAM_METADATA_RETRY_INTERVAL_MS: '7200000' }).instagramMetadataRetryIntervalMs, 7200000);
     for (const name of Object.keys(required)) {
         assert.throws(() => loadConfig({ ...required, [name]: ' ' }), new RegExp(name));
     }
@@ -27,4 +30,7 @@ test('invalid port and timeout settings fail before services are started', () =>
     }
     assert.throws(() => loadConfig({ ...required, PORT: '65536' }), /PORT/);
     assert.equal(loadConfig({ ...required, PORT: '4000' }).port, 4000);
+    for (const value of ['', 'abc', '-1', '1.5', 'Infinity', '2147483648']) {
+        assert.throws(() => loadConfig({ ...required, INSTAGRAM_METADATA_RETRY_INTERVAL_MS: value }), /INSTAGRAM_METADATA_RETRY_INTERVAL_MS/);
+    }
 });

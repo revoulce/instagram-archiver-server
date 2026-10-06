@@ -6,6 +6,7 @@ import { taskIdentity, requiresDeliveryReview } from '../../domain/taskIdentity'
 import { PermanentTaskError, TelegramRateLimitError, InstagramRestrictionError, InstagramWaitError, InstagramWaitReason } from '../../domain/taskErrors';
 import { ProcessTask } from '../../application/ProcessTask';
 import { InstagramSessionGate, InstagramQueueOptions } from './InstagramSessionGate';
+import { randomUUID } from 'crypto';
 
 type TaskData = Pick<DownloadTask, 'url' | 'source'> & {
     checkpoint?: TaskCheckpoint;
@@ -16,8 +17,13 @@ export class QueueService implements ITaskQueue {
     private queue: Queue<TaskData>;
     private worker: Worker<TaskData>;
     private startup: Promise<void>;
+    private metadataRetryIntervalMs: number;
+    private retryTimer?: NodeJS.Timeout;
+    private retrySweep?: Promise<number>;
+    private closing = false;
 
-    constructor(redisHost: string, redisPort: number, downloader: IDownloader, notifier: INotifier, namespace = 'instagram-tasks', options: InstagramQueueOptions = {}) {
+    constructor(redisHost: string, redisPort: number, downloader: IDownloader, notifier: INotifier, namespace = 'instagram-tasks', options: InstagramQueueOptions & { metadataRetryIntervalMs?: number } = {}) {
+        this.metadataRetryIntervalMs = options.metadataRetryIntervalMs ?? 3_600_000;
         const connection = { host: redisHost, port: redisPort };
         // HTTP requests fail promptly while the worker keeps reconnecting in the background.
         this.queue = new Queue<TaskData>(namespace, {
@@ -85,6 +91,13 @@ export class QueueService implements ITaskQueue {
             // The worker connection keeps reconnecting if Redis is unavailable
             // at startup; the HTTP queue connection intentionally fails fast.
             await client.hset(this.queue.toKey('meta'), { concurrency: 1 });
+            await this.queue.waitUntilReady();
+            await this.retryMetadataFailures();
+            if (this.closing) return;
+            if (this.metadataRetryIntervalMs > 0) {
+                this.retryTimer = setInterval(() => { void this.retryMetadataFailures(); }, this.metadataRetryIntervalMs);
+                this.retryTimer.unref();
+            }
             void this.worker.run().catch(error => console.error('Worker stopped:', error.message));
         });
         this.startup.catch(error => console.error('Queue startup failed:', error.message));
@@ -151,6 +164,62 @@ export class QueueService implements ITaskQueue {
         }
     }
 
+    private canAutomaticallyRetry(job: Job<TaskData>): boolean {
+        const checkpoint = job.data.checkpoint;
+        return job.failedReason?.startsWith('Gallery-dl returned incomplete or inconsistent post metadata') === true &&
+            !requiresDeliveryReview(checkpoint) &&
+            (checkpoint?.nextFileIndex ?? 0) === 0 && !(checkpoint?.messageIds?.length);
+    }
+
+    // Startup and timer scans share a Redis cooldown across replicas/restarts.
+    // A fresh generation and delivery checkpoint are checked before each retry.
+    private async retryMetadataFailures(): Promise<number> {
+        if (this.closing || !this.metadataRetryIntervalMs) return 0;
+        if (this.retrySweep) return this.retrySweep;
+        this.retrySweep = this.sweepMetadataFailures().catch(() => {
+            console.error('[Queue] Automatic metadata retry scan failed; will try again next interval');
+            return 0;
+        }).finally(() => { this.retrySweep = undefined; });
+        return this.retrySweep;
+    }
+
+    private async sweepMetadataFailures(): Promise<number> {
+        const candidates = (await this.queue.getFailed(0, 4999)).filter(job => this.canAutomaticallyRetry(job));
+        if (!candidates.length || this.closing) return 0;
+        const client = await this.queue.client;
+        const key = this.queue.toKey('metadata-auto-retry');
+        const token = randomUUID();
+        client.defineCommand('archiverMetadataRetryClaim', { numberOfKeys: 1,
+            lua: "return redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2], 'NX')" });
+        client.defineCommand('archiverMetadataRetryRelease', { numberOfKeys: 1,
+            lua: "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0" });
+        const expiresAt = Date.now() + this.metadataRetryIntervalMs;
+        if (!await client.runCommand('archiverMetadataRetryClaim', [key, token, this.metadataRetryIntervalMs])) return 0;
+        let retried = 0;
+        try {
+            for (const candidate of candidates) {
+                if (this.closing || Date.now() >= expiresAt) break;
+                const current = await this.queue.getJob(candidate.id!);
+                if (!current || current.finishedOn !== candidate.finishedOn || !this.canAutomaticallyRetry(current) ||
+                    await current.getState() !== 'failed') continue;
+                try {
+                    await current.retry('failed', { resetAttemptsMade: true, resetAttemptsStarted: true });
+                    retried++;
+                } catch (error) {
+                    // A manual retry or removal may win the atomic state transition.
+                    const remaining = await this.queue.getJob(candidate.id!);
+                    if (remaining && await remaining.getState() === 'failed') throw error;
+                }
+            }
+        } catch (error) {
+            // Release only our claim so a later startup can recover after a Redis error.
+            await client.runCommand('archiverMetadataRetryRelease', [key, token]).catch(() => {});
+            throw error;
+        }
+        if (retried) console.log(`[Queue] Automatically requeued ${retried} metadata-failed task(s)`);
+        return retried;
+    }
+
     async isReady(): Promise<boolean> {
         if (!this.worker.isRunning()) return false;
         const [client, workerClient] = await Promise.all([this.queue.client, this.worker.client]);
@@ -160,6 +229,9 @@ export class QueueService implements ITaskQueue {
     }
 
     async close(): Promise<void> {
+        this.closing = true;
+        if (this.retryTimer) clearInterval(this.retryTimer);
+        await this.retrySweep;
         await this.startup.catch(() => {});
         await this.worker.close();
         await this.queue.close();
