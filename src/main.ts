@@ -33,6 +33,7 @@ const queueService = new QueueService(
         rateLimitCooldownMs: config.instagramRateLimitCooldownMs,
         cookiesPollMs: config.instagramCookiesPollMs,
         metadataRetryIntervalMs: config.instagramMetadataRetryIntervalMs,
+        telegramRetryIntervalMs: config.telegramChannelRetryIntervalMs,
     }
 );
 

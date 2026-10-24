@@ -3,7 +3,7 @@ import { InputMediaPhoto, InputMediaVideo } from 'grammy/types';
 import { extname } from 'path';
 import { DeliveryOptions, INotifier } from '../../domain/interfaces';
 import { MediaMetadata } from '../../domain/entities';
-import { PermanentTaskError, TelegramRateLimitError } from '../../domain/taskErrors';
+import { PermanentTaskError, TelegramChannelAccessError, TelegramRateLimitError } from '../../domain/taskErrors';
 import { buildCaption } from './caption';
 
 export class GrammyService implements INotifier {
@@ -11,6 +11,19 @@ export class GrammyService implements INotifier {
 
     constructor(token: string, private channelId: string) {
         this.bot = new Bot(token);
+    }
+
+    async canSendToChannel(): Promise<boolean> {
+        try {
+            const bot = await this.bot.api.getMe();
+            const member = await this.bot.api.getChatMember(this.channelId, bot.id);
+            return member.status === 'creator' ||
+                (member.status === 'administrator' && member.can_post_messages === true);
+        } catch {
+            // Missing membership, missing permissions, and temporary Telegram
+            // API errors all defer recovery until the next scheduled check.
+            return false;
+        }
     }
 
     async sendPost(metadata: MediaMetadata, originalUrl: string, options?: DeliveryOptions): Promise<void> {
@@ -52,6 +65,7 @@ export class GrammyService implements INotifier {
                     if (error.error_code === 429) {
                         throw new TelegramRateLimitError(Math.max(1, error.parameters.retry_after ?? 5) * 1000);
                     }
+                    if (error.error_code === 403) throw new TelegramChannelAccessError();
                     throw new PermanentTaskError('Telegram rejected the media or channel permissions');
                 }
                 throw error;

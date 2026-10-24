@@ -3,7 +3,7 @@ import { ITaskQueue, IDownloader, INotifier } from '../../domain/interfaces';
 import { DownloadTask, TaskCheckpoint, TaskStatus } from '../../domain/entities';
 import { normalizeInstagramUrl } from '../../domain/instagramUrl';
 import { taskIdentity, requiresDeliveryReview } from '../../domain/taskIdentity';
-import { PermanentTaskError, TelegramRateLimitError, InstagramRestrictionError, InstagramWaitError, InstagramWaitReason } from '../../domain/taskErrors';
+import { PermanentTaskError, TelegramChannelAccessError, TelegramRateLimitError, InstagramRestrictionError, InstagramWaitError, InstagramWaitReason } from '../../domain/taskErrors';
 import { ProcessTask } from '../../application/ProcessTask';
 import { InstagramSessionGate, InstagramQueueOptions } from './InstagramSessionGate';
 import { randomUUID } from 'crypto';
@@ -11,6 +11,7 @@ import { randomUUID } from 'crypto';
 type TaskData = Pick<DownloadTask, 'url' | 'source'> & {
     checkpoint?: TaskCheckpoint;
     instagramWait?: { reason: InstagramWaitReason; checkAt: number };
+    telegramAutoRetryCount?: number;
 };
 
 export class QueueService implements ITaskQueue {
@@ -18,12 +19,16 @@ export class QueueService implements ITaskQueue {
     private worker: Worker<TaskData>;
     private startup: Promise<void>;
     private metadataRetryIntervalMs: number;
+    private telegramRetryIntervalMs: number;
     private retryTimer?: NodeJS.Timeout;
     private retrySweep?: Promise<number>;
+    private telegramRetryTimer?: NodeJS.Timeout;
+    private telegramRetrySweep?: Promise<number>;
     private closing = false;
 
-    constructor(redisHost: string, redisPort: number, downloader: IDownloader, notifier: INotifier, namespace = 'instagram-tasks', options: InstagramQueueOptions & { metadataRetryIntervalMs?: number } = {}) {
+    constructor(redisHost: string, redisPort: number, downloader: IDownloader, private notifier: INotifier, namespace = 'instagram-tasks', options: InstagramQueueOptions & { metadataRetryIntervalMs?: number; telegramRetryIntervalMs?: number } = {}) {
         this.metadataRetryIntervalMs = options.metadataRetryIntervalMs ?? 3_600_000;
+        this.telegramRetryIntervalMs = options.telegramRetryIntervalMs ?? 60_000;
         const connection = { host: redisHost, port: redisPort };
         // HTTP requests fail promptly while the worker keeps reconnecting in the background.
         this.queue = new Queue<TaskData>(namespace, {
@@ -98,7 +103,12 @@ export class QueueService implements ITaskQueue {
                 this.retryTimer = setInterval(() => { void this.retryMetadataFailures(); }, this.metadataRetryIntervalMs);
                 this.retryTimer.unref();
             }
+            if (this.telegramRetryIntervalMs > 0 && notifier.canSendToChannel) {
+                this.telegramRetryTimer = setInterval(() => { void this.retryTelegramAccessFailures(); }, this.telegramRetryIntervalMs);
+                this.telegramRetryTimer.unref();
+            }
             void this.worker.run().catch(error => console.error('Worker stopped:', error.message));
+            void this.retryTelegramAccessFailures();
         });
         this.startup.catch(error => console.error('Queue startup failed:', error.message));
     }
@@ -171,6 +181,79 @@ export class QueueService implements ITaskQueue {
             (checkpoint?.nextFileIndex ?? 0) === 0 && !(checkpoint?.messageIds?.length);
     }
 
+    private canAutomaticallyRetryTelegram(job: Job<TaskData>): boolean {
+        const checkpoint = job.data.checkpoint;
+        const currentAccessFailure = job.failedReason?.startsWith(TelegramChannelAccessError.messagePrefix) === true;
+        // Pick up safe 403 failures written by versions that used this generic
+        // permanent-error message before channel access recovery existed.
+        const legacyAccessFailure = job.failedReason === 'Telegram rejected the media or channel permissions';
+        return (currentAccessFailure || legacyAccessFailure) &&
+            (job.data.telegramAutoRetryCount ?? 0) < 3 &&
+            !requiresDeliveryReview(checkpoint) &&
+            (checkpoint?.nextFileIndex ?? 0) === 0 && !(checkpoint?.messageIds?.length);
+    }
+
+    // Recheck channel permissions before requeueing definite Telegram 403s.
+    // Safe failures are added back in one sweep; worker pacing drains them over time.
+    private async retryTelegramAccessFailures(): Promise<number> {
+        if (this.closing || !this.telegramRetryIntervalMs || !this.notifierCanSendToChannel) return 0;
+        if (this.telegramRetrySweep) return this.telegramRetrySweep;
+        this.telegramRetrySweep = this.sweepTelegramAccessFailures().catch(() => {
+            console.error('[Queue] Automatic Telegram retry scan failed; will try again next interval');
+            return 0;
+        }).finally(() => { this.telegramRetrySweep = undefined; });
+        return this.telegramRetrySweep;
+    }
+
+    private get notifierCanSendToChannel(): (() => Promise<boolean>) | undefined {
+        return this.notifier.canSendToChannel?.bind(this.notifier);
+    }
+
+    private async sweepTelegramAccessFailures(): Promise<number> {
+        const candidates = (await this.queue.getFailed(0, 4999)).filter(job => this.canAutomaticallyRetryTelegram(job));
+        if (!candidates.length || this.closing) return 0;
+        const client = await this.queue.client;
+        const key = this.queue.toKey('telegram-access-auto-retry');
+        const token = randomUUID();
+        client.defineCommand('archiverTelegramRetryClaim', { numberOfKeys: 1,
+            lua: "return redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2], 'NX')" });
+        client.defineCommand('archiverTelegramRetryRelease', { numberOfKeys: 1,
+            lua: "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0" });
+        const expiresAt = Date.now() + this.telegramRetryIntervalMs;
+        if (!await client.runCommand('archiverTelegramRetryClaim', [key, token, this.telegramRetryIntervalMs])) return 0;
+        let retried = 0;
+        try {
+            if (!await this.notifierCanSendToChannel!()) return 0;
+            for (const candidate of candidates) {
+                if (this.closing || Date.now() >= expiresAt) break;
+                const current = await this.queue.getJob(candidate.id!);
+                if (!current || current.finishedOn !== candidate.finishedOn || !this.canAutomaticallyRetryTelegram(current) ||
+                    await current.getState() !== 'failed') continue;
+                const previousData = current.data;
+                const nextData: TaskData = {
+                    ...previousData,
+                    telegramAutoRetryCount: (previousData.telegramAutoRetryCount ?? 0) + 1,
+                };
+                await current.updateData(nextData);
+                try {
+                    await current.retry('failed', { resetAttemptsMade: true, resetAttemptsStarted: true });
+                    retried++;
+                } catch (error) {
+                    const remaining = await this.queue.getJob(candidate.id!);
+                    if (remaining && await remaining.getState() === 'failed') {
+                        await remaining.updateData(previousData).catch(() => {});
+                        throw error;
+                    }
+                }
+            }
+        } catch (error) {
+            await client.runCommand('archiverTelegramRetryRelease', [key, token]).catch(() => {});
+            throw error;
+        }
+        if (retried) console.log(`[Queue] Automatically requeued ${retried} safe Telegram channel task(s)`);
+        return retried;
+    }
+
     // Startup and timer scans share a Redis cooldown across replicas/restarts.
     // A fresh generation and delivery checkpoint are checked before each retry.
     private async retryMetadataFailures(): Promise<number> {
@@ -231,6 +314,7 @@ export class QueueService implements ITaskQueue {
     async close(): Promise<void> {
         this.closing = true;
         if (this.retryTimer) clearInterval(this.retryTimer);
+        if (this.telegramRetryTimer) clearInterval(this.telegramRetryTimer);
         await this.retrySweep;
         await this.startup.catch(() => {});
         await this.worker.close();

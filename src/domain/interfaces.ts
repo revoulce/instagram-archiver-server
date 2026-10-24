@@ -24,6 +24,8 @@ export interface INotifier {
     sendPost(metadata: MediaMetadata, originalUrl: string, options?: DeliveryOptions): Promise<void>;
 
     sendError(error: string): Promise<void>;
+
+    canSendToChannel?(): Promise<boolean>;
 }
 
 export interface ITaskQueue {

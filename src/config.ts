@@ -16,6 +16,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     const metadataRetryRaw = env.INSTAGRAM_METADATA_RETRY_INTERVAL_MS;
     const metadataRetryIntervalMs = metadataRetryRaw === '0' ? 0
         : integer('INSTAGRAM_METADATA_RETRY_INTERVAL_MS', 3_600_000, 2_147_483_647);
+    const telegramRetryRaw = env.TELEGRAM_CHANNEL_RETRY_INTERVAL_MS;
+    const telegramRetryIntervalMs = telegramRetryRaw === '0' ? 0
+        : integer('TELEGRAM_CHANNEL_RETRY_INTERVAL_MS', 60_000, 2_147_483_647);
     return {
         port: integer('PORT', 3000, 65535),
         authSecret: required('AUTH_SECRET'),
@@ -32,5 +35,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
         instagramRateLimitCooldownMs: integer('INSTAGRAM_RATE_LIMIT_COOLDOWN_MS', 3_600_000, 2_147_483_647),
         instagramCookiesPollMs: integer('INSTAGRAM_COOKIES_POLL_MS', 30_000, 600_000),
         instagramMetadataRetryIntervalMs: metadataRetryIntervalMs,
+        telegramChannelRetryIntervalMs: telegramRetryIntervalMs,
     };
 }

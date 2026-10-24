@@ -1,5 +1,15 @@
 export class PermanentTaskError extends Error {}
 
+// A 403 means Telegram definitely rejected this batch, so the task itself is
+// safe to stop. QueueService can requeue it later after channel access returns.
+export class TelegramChannelAccessError extends PermanentTaskError {
+    static readonly messagePrefix = 'Telegram channel access unavailable';
+
+    constructor() {
+        super(TelegramChannelAccessError.messagePrefix);
+    }
+}
+
 export class DeliveryUncertainError extends PermanentTaskError {
     constructor() {
         super('Telegram delivery is uncertain. Review the channel before sending again.');
